@@ -9,21 +9,19 @@ License: GNU
 package routes
 
 import (
-	"bytes"
 	"fmt"
 	"net/url"
+	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gin-gonic/gin/binding"
 	"github.com/go-errors/errors"
 	"github.com/grafov/m3u8"
 	"github.com/spf13/viper"
-	"github.com/z3ntl3/MolyRevProxy/globals"
+	"github.com/z3ntl3/MolyRevProxy/bot"
 )
 
-/*
-testing not complete
-*/
 func Manifest_Stream(ctx *gin.Context) {
 	var err error
 	var res []byte
@@ -38,6 +36,7 @@ func Manifest_Stream(ctx *gin.Context) {
 			})
 			return
 		}
+		ctx_.Header("Content-Type", "application/vnd.apple.mpegurl")
 		ctx_.Writer.Write(*res_)
 	}(&res, &err, ctx)
 
@@ -51,50 +50,37 @@ func Manifest_Stream(ctx *gin.Context) {
 		return
 	}
 
-	// client := bot.NewClient(time.Second * 5)
-	// manifest, err := client.GetManifest(videoCtx.URL, true)
-	// if err != nil {
-	// 	fmt.Println(err)
-	// 	ctx.AbortWithError(500, err)
-	// 	return
-	// }
-
-	master := m3u8.NewMasterPlaylist()
-	{
-		if err = master.Decode(*bytes.NewBufferString(globals.MasterDummy), true); err != nil {
-			return
-		}
-	}
-
-	media, err := m3u8.NewMediaPlaylist(uint(20000), uint(20000))
+	client := bot.NewClient(time.Second * 10)
+	manifest, err := client.GetManifest(videoCtx.URL, true)
 	if err != nil {
 		return
 	}
 
-	if err = media.Decode(*bytes.NewBufferString(globals.MediaDummy), true); err != nil {
+	master := m3u8.NewMasterPlaylist()
+	if err = master.DecodeFrom(strings.NewReader(manifest.Raw), true); err == nil && len(master.Variants) > 0 {
+		if err = manipulate(master); err != nil {
+			return
+		}
+		res = master.Encode().Bytes()
 		return
 	}
 
-	// manipulated master & media manifest
-	var man_master []*m3u8.MasterPlaylist = make([]*m3u8.MasterPlaylist, 1)
-	var man_media []*m3u8.MediaPlaylist = make([]*m3u8.MediaPlaylist, 1)
-	{
-		copy(man_master, []*m3u8.MasterPlaylist{master})
-		copy(man_media, []*m3u8.MediaPlaylist{media})
+	media, mediaErr := m3u8.NewMediaPlaylist(uint(20000), uint(20000))
+	if mediaErr != nil {
+		err = mediaErr
+		return
 	}
 
-	task := []interface{}{man_media[0], man_master[0]}
-	for _, v := range task {
-		if err = manipulate(v); err != nil {
-			return
-		}
+	err = media.DecodeFrom(strings.NewReader(manifest.Raw), true)
+	if err != nil {
+		return
 	}
 
-	// for k, v := range manifest.Headers {
-	// 	ctx.Header(k, strings.Join(v, ""))
-	// }
+	if err = manipulate(media); err != nil {
+		return
+	}
 
-	res = man_media[0].Encode().Bytes()
+	res = media.Encode().Bytes()
 }
 
 func manipulate(data interface{}) (err error) {

@@ -10,8 +10,11 @@ package bot
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
@@ -21,34 +24,47 @@ import (
 	"github.com/z3ntl3/MolyRevProxy/models"
 	"go.mongodb.org/mongo-driver/bson"
 	"h12.io/socks"
-
-	"github.com/antchfx/htmlquery"
 )
 
-func ObtainManifest(body io.Reader) (string, error) {
-	doc, err := htmlquery.Parse(body)
+var m3u8Pattern = regexp.MustCompile(`((https?:\\/\\/|https?://|\\/|/)[^"'\\s]+?\\.m3u8[^"'\\s]*)`)
+
+func ObtainManifest(body io.Reader, pageURL string) (string, error) {
+	raw, err := io.ReadAll(body)
 	if err != nil {
 		return "", err
 	}
 
-	tree, err := htmlquery.Query(doc, "/html/body/script[7]")
-	if err != nil {
-		return "", err
-	}
-
-	if tree == nil {
-		return "", errors.New("tree not parsed")
-	}
-
-	manifest := htmlquery.InnerText(tree)
-
-	if !strings.Contains(manifest, "m3u8") {
+	candidate := m3u8Pattern.FindString(string(raw))
+	if candidate == "" {
 		return "", errors.New("no manifest found")
 	}
-	manifest = strings.Split(strings.Split(manifest, "player.setup(")[1], ");")[0]
-	manifest = strings.Split(strings.Split(manifest, "sources: [{file:\"")[1], "\"}")[0]
 
-	return manifest, nil
+	candidate = strings.ReplaceAll(candidate, `\/`, `/`)
+	candidate = strings.ReplaceAll(candidate, `\u002F`, `/`)
+
+	if strings.HasPrefix(candidate, "//") {
+		candidate = "https:" + candidate
+	}
+
+	base, err := url.Parse(pageURL)
+	if err != nil {
+		return "", err
+	}
+
+	manifestURL, err := url.Parse(candidate)
+	if err != nil {
+		return "", err
+	}
+
+	if !manifestURL.IsAbs() {
+		manifestURL = base.ResolveReference(manifestURL)
+	}
+
+	if !strings.Contains(manifestURL.Path, ".m3u8") {
+		return "", errors.New("no valid m3u8 manifest found")
+	}
+
+	return manifestURL.String(), nil
 }
 
 type Client struct {
@@ -119,7 +135,7 @@ func (c *Client) GetManifest(url string, init bool) (*ManifestCtx, error) {
 				}
 
 				if res.StatusCode != 200 {
-					err = errors.Errorf("Status code '%d' with body %s", res.StatusCode, body)
+					err = errors.Errorf("status code '%d' with body %s", res.StatusCode, body)
 					return
 				}
 
@@ -130,7 +146,7 @@ func (c *Client) GetManifest(url string, init bool) (*ManifestCtx, error) {
 					return
 				}
 
-				link, err := ObtainManifest(strings.NewReader(string(body)))
+				link, err := ObtainManifest(strings.NewReader(string(body)), url)
 				if err != nil {
 					return
 				}
@@ -149,7 +165,7 @@ func (c *Client) GetManifest(url string, init bool) (*ManifestCtx, error) {
 	for {
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, fmt.Errorf("timeout while fetching manifest for %s", url)
 
 		case task := <-workerPool:
 			if task.Err != nil {
@@ -230,7 +246,7 @@ func (c *Client) read_manifest(req *http.Request, link string) (string, error) {
 	}
 
 	if res.StatusCode != 200 {
-		err = errors.Errorf("Status code '%d' with body %s", res.StatusCode, body)
+		err = errors.Errorf("status code '%d' with body %s", res.StatusCode, body)
 		return result, err
 	}
 
