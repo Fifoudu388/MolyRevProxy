@@ -161,12 +161,19 @@ func (c *Client) GetManifest(url string, init bool) (*ManifestCtx, error) {
 		}
 	}(workerPool, init)
 
+	var lastErr error
+	remaining := cap(workerPool)
 	for {
 		select {
 		case <-ctx.Done():
 			return nil, fmt.Errorf("manifest fetch canceled for %s: %w", url, ctx.Err())
 		case task := <-workerPool:
 			if task.Err != nil {
+				lastErr = task.Err
+				remaining--
+				if remaining == 0 {
+					return nil, fmt.Errorf("manifest fetch failed for %s: %w", url, lastErr)
+				}
 				continue
 			}
 			return &task.Ctx, nil
