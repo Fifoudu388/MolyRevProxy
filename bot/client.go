@@ -10,8 +10,11 @@ package bot
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
@@ -21,34 +24,42 @@ import (
 	"github.com/z3ntl3/MolyRevProxy/models"
 	"go.mongodb.org/mongo-driver/bson"
 	"h12.io/socks"
-
-	"github.com/antchfx/htmlquery"
 )
 
-func ObtainManifest(body io.Reader) (string, error) {
-	doc, err := htmlquery.Parse(body)
-	if err != nil {
-		return "", err
-	}
+var m3u8Pattern = regexp.MustCompile(`((https?:\\/\\/|https?://|\\/|/)[^"'\\s]+?\\.m3u8[^"'\\s]*)`)
 
-	tree, err := htmlquery.Query(doc, "/html/body/script[7]")
-	if err != nil {
-		return "", err
-	}
-
-	if tree == nil {
-		return "", errors.New("tree not parsed")
-	}
-
-	manifest := htmlquery.InnerText(tree)
-
-	if !strings.Contains(manifest, "m3u8") {
+func ObtainManifest(body []byte, pageURL string) (string, error) {
+	candidate := m3u8Pattern.FindString(string(body))
+	if candidate == "" {
 		return "", errors.New("no manifest found")
 	}
-	manifest = strings.Split(strings.Split(manifest, "player.setup(")[1], ");")[0]
-	manifest = strings.Split(strings.Split(manifest, "sources: [{file:\"")[1], "\"}")[0]
 
-	return manifest, nil
+	candidate = strings.ReplaceAll(candidate, `\/`, `/`)
+	candidate = strings.ReplaceAll(candidate, `\u002F`, `/`)
+
+	if strings.HasPrefix(candidate, "//") {
+		candidate = "https:" + candidate
+	}
+
+	base, err := url.Parse(pageURL)
+	if err != nil {
+		return "", err
+	}
+
+	manifestURL, err := url.Parse(candidate)
+	if err != nil {
+		return "", err
+	}
+
+	if !manifestURL.IsAbs() {
+		manifestURL = base.ResolveReference(manifestURL)
+	}
+
+	if !strings.Contains(manifestURL.Path, ".m3u8") {
+		return "", errors.New("no valid m3u8 manifest found")
+	}
+
+	return manifestURL.String(), nil
 }
 
 type Client struct {
@@ -73,13 +84,18 @@ func NewClient(timeout time.Duration) *Client {
 to unveil underlying m3u8 manifest
 */
 func (c *Client) GetManifest(url string, init bool) (*ManifestCtx, error) {
+	timeout := c.Client.Timeout
+	if timeout <= 0 {
+		timeout = time.Second * 5
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
 	workerPool := make(chan struct {
 		Err error
 		Ctx ManifestCtx
 	}, 5)
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
-	defer cancel()
 
 	go func(pool chan struct {
 		Err error
@@ -87,9 +103,9 @@ func (c *Client) GetManifest(url string, init bool) (*ManifestCtx, error) {
 	}, master bool,
 	) {
 		for i := 0; i < cap(pool); i++ {
-			go func() {
+			go func(ctx context.Context) {
 				var err error
-				var ctx ManifestCtx
+				var result ManifestCtx
 
 				defer func(err_ *error, ctx_ *ManifestCtx) {
 					pool <- struct {
@@ -99,9 +115,9 @@ func (c *Client) GetManifest(url string, init bool) (*ManifestCtx, error) {
 						Err: *err_,
 						Ctx: *ctx_,
 					}
-				}(&err, &ctx)
+				}(&err, &result)
 
-				req, err := http.NewRequest(http.MethodGet, url, nil)
+				req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 				if err != nil {
 					return
 				}
@@ -118,41 +134,46 @@ func (c *Client) GetManifest(url string, init bool) (*ManifestCtx, error) {
 					return
 				}
 
-				if res.StatusCode != 200 {
-					err = errors.Errorf("Status code '%d' with body %s", res.StatusCode, body)
+				if res.StatusCode != http.StatusOK {
+					err = errors.Errorf("status code '%d' with body %s", res.StatusCode, body)
 					return
 				}
 
 				if !master {
-					ctx.Headers = req.Header
-					ctx.Raw = string(body)
-
+					result.Headers = req.Header
+					result.Raw = string(body)
 					return
 				}
 
-				link, err := ObtainManifest(strings.NewReader(string(body)))
+				link, err := ObtainManifest(body, url)
 				if err != nil {
 					return
 				}
 
-				data, err := c.read_manifest(req, link)
+				data, err := c.read_manifest(ctx, link)
 				if err != nil {
 					return
 				}
 
-				ctx.Headers = req.Header
-				ctx.Raw = data
-			}()
+				result.Headers = req.Header
+				result.Raw = data
+			}(ctx)
 		}
 	}(workerPool, init)
 
+	var lastErr error
+	remaining := cap(workerPool)
 	for {
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
-
+			return nil, fmt.Errorf("manifest fetch canceled for %s: %w", url, ctx.Err())
 		case task := <-workerPool:
 			if task.Err != nil {
+				lastErr = task.Err
+				remaining--
+				if remaining == 0 {
+					return nil, fmt.Errorf("manifest fetch failed for %s: %w", url, lastErr)
+				}
 				continue
 			}
 			return &task.Ctx, nil
@@ -201,41 +222,34 @@ func StreamCore(molyLink string) (*models.StreamData, error) {
 	case v := <-task:
 		return &v.Res, v.Err
 	case <-ctx.Done():
-		{
-			v := <-task
-			return nil, v.Err
-		}
+		v := <-task
+		return nil, v.Err
 	}
 }
 
-func (c *Client) read_manifest(req *http.Request, link string) (string, error) {
-	var err error
-	var result string
-
-	req, err = http.NewRequest(http.MethodGet, link, nil)
+func (c *Client) read_manifest(ctx context.Context, link string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, link, nil)
 	if err != nil {
-		return result, err
+		return "", err
 	}
 
 	build_headers(req)
 	res, err := c.Client.Do(req)
 	if err != nil {
-		return result, err
+		return "", err
 	}
 	defer res.Body.Close()
 
 	body, err := io.ReadAll(res.Body)
 	if err != nil {
-		return result, err
+		return "", err
 	}
 
-	if res.StatusCode != 200 {
-		err = errors.Errorf("Status code '%d' with body %s", res.StatusCode, body)
-		return result, err
+	if res.StatusCode != http.StatusOK {
+		return "", errors.Errorf("status code '%d' with body %s", res.StatusCode, body)
 	}
 
-	result = string(body)
-	return result, err
+	return string(body), nil
 }
 
 func build_headers(req *http.Request) {
