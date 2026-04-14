@@ -65,7 +65,7 @@ func Manifest_Stream(ctx *gin.Context) {
 		return
 	}
 
-	media, mediaErr := m3u8.NewMediaPlaylist(uint(20000), uint(20000))
+	media, mediaErr := m3u8.NewMediaPlaylist(uint(1000), uint(1000))
 	if mediaErr != nil {
 		err = mediaErr
 		return
@@ -84,6 +84,11 @@ func Manifest_Stream(ctx *gin.Context) {
 }
 
 func manipulate(data interface{}) (err error) {
+	domain, err := serverDomain()
+	if err != nil {
+		return err
+	}
+
 	master, isMaster := data.(*m3u8.MasterPlaylist)
 	main, isMain := data.(*m3u8.MediaPlaylist)
 
@@ -104,7 +109,7 @@ func manipulate(data interface{}) (err error) {
 				return err
 			}
 
-			uri.Host = viper.GetStringMap("server")["domain"].(string)
+			uri.Host = domain
 			main.Segments[k].URI = uri.String()
 		}
 		return
@@ -121,8 +126,21 @@ func manipulate(data interface{}) (err error) {
 			return err
 		}
 
-		uri.Host = viper.GetStringMap("server")["domain"].(string)
+		uri.Host = domain
 		master.Variants[k].URI = uri.String()
 	}
 	return
+}
+
+func serverDomain() (string, error) {
+	domain := strings.TrimSpace(viper.GetString("server.domain"))
+	if domain == "" {
+		return "", errors.New("invalid config: server.domain is required")
+	}
+
+	if strings.Contains(domain, "://") {
+		return "", errors.New("invalid config: server.domain must be a host without scheme")
+	}
+
+	return domain, nil
 }
